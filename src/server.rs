@@ -21,6 +21,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
 };
+use tracing::Instrument;
 
 /// HTTP server.
 pub struct Server<A = DefaultAcceptor> {
@@ -174,17 +175,36 @@ impl<A> Server<A> {
 
         let accept_loop_future = async {
             loop {
+                let connection_span = tracing::debug_span!(
+                    "connection",
+                    server.address = incoming.local_addr().ok().map(|addr| tracing::field::display(addr.ip())),
+                    server.port = incoming.local_addr().ok().map(|addr| addr.port()),
+                    client.address = tracing::field::Empty,
+                    client.port = tracing::field::Empty,
+                );
                 let (tcp_stream, socket_addr) = tokio::select! {
                     biased;
-                    result = accept(&mut incoming) => result,
+                    result = accept(&mut incoming).instrument(tracing::debug_span!("accept connection")) => result,
                     _ = handle.wait_graceful_shutdown() => return Ok(()),
                 };
 
+                connection_span.record("client.address", tracing::field::display(socket_addr.ip()));
+                connection_span.record("client.port", socket_addr.port());
+
+                let ready_make_service_span = tracing::debug_span!(
+                    parent: connection_span.id(),
+                    "ready make service"
+                );
                 poll_fn(|cx| make_service.poll_ready(cx))
+                    .instrument(ready_make_service_span)
                     .await
                     .map_err(io_other)?;
 
-                let service = match make_service.make_service(socket_addr).await {
+                let make_service_span = tracing::debug_span!(
+                    parent: connection_span.id(),
+                    "make service"
+                );
+                let service = match make_service.make_service(socket_addr).instrument(make_service_span).await {
                     Ok(service) => service,
                     Err(_) => continue,
                 };
@@ -194,12 +214,12 @@ impl<A> Server<A> {
                 let builder = builder.clone();
 
                 tokio::spawn(async move {
-                    if let Ok((stream, send_service)) = acceptor.accept(tcp_stream, service).await {
+                    if let Ok((stream, send_service)) = acceptor.accept(tcp_stream, service).instrument(tracing::debug_span!(parent: connection_span.id(), "accept handshake")).await {
                         let io = TokioIo::new(stream);
                         let service = send_service.into_service();
                         let service = TowerToHyperService::new(service);
 
-                        let serve_future = builder.serve_connection_with_upgrades(io, service);
+                        let serve_future = builder.serve_connection_with_upgrades(io, service).instrument(tracing::debug_span!(parent: connection_span.id(), "serve connection"));
                         tokio::pin!(serve_future);
 
                         tokio::select! {

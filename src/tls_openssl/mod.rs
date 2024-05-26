@@ -43,6 +43,7 @@ use openssl::{
 use std::{convert::TryFrom, fmt, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
+use tracing::{field::Empty, instrument::{Instrument, Instrumented}};
 
 pub mod future;
 
@@ -109,13 +110,14 @@ where
 {
     type Stream = SslStream<A::Stream>;
     type Service = A::Service;
-    type Future = OpenSSLAcceptorFuture<A::Future, A::Stream, A::Service>;
+    type Future = Instrumented<OpenSSLAcceptorFuture<A::Future, A::Stream, A::Service>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner_future = self.inner.accept(stream, service);
         let config = self.config.clone();
 
         OpenSSLAcceptorFuture::new(inner_future, config, self.handshake_timeout)
+            .instrument(tracing::debug_span!("tls handshake", tls.cipher = Empty, tls.protocol.name = Empty, tls.protocol.version = Empty, tls.established = Empty))
     }
 }
 

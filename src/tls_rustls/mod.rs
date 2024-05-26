@@ -42,6 +42,7 @@ use tokio::{
     task::spawn_blocking,
 };
 use tokio_rustls::server::TlsStream;
+use tracing::{field::Empty, instrument::{Instrument, Instrumented}};
 
 pub(crate) mod export {
     use super::*;
@@ -135,13 +136,14 @@ where
 {
     type Stream = TlsStream<A::Stream>;
     type Service = A::Service;
-    type Future = RustlsAcceptorFuture<A::Future, A::Stream, A::Service>;
+    type Future = Instrumented<RustlsAcceptorFuture<A::Future, A::Stream, A::Service>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner_future = self.inner.accept(stream, service);
         let config = self.config.clone();
 
         RustlsAcceptorFuture::new(inner_future, config, self.handshake_timeout)
+            .instrument(tracing::debug_span!("tls handshake", tls.cipher = Empty, tls.protocol.name = Empty, tls.protocol.version = Empty, tls.established = Empty))
     }
 }
 
