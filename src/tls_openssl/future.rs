@@ -155,6 +155,18 @@ where
                     Poll::Ready(Ok(Ok(stream))) => {
                         let service = service.take().expect("future polled after ready");
 
+                        let span = tracing::Span::current();
+                        if !span.is_disabled() {
+                            let connection = stream.ssl();
+                            let (protocol_name, protocol_version) = connection.version_str().split_once('v').map(|(name, ver)| (name.to_ascii_lowercase(), ver)).unzip();
+                            let cipher = connection.current_cipher().map(|c| c.standard_name());
+
+                            span.record("tls.protocol.name", protocol_name);
+                            span.record("tls.protocol.version", protocol_version);
+                            span.record("tls.cipher", cipher);
+                            span.record("tls.established", true);
+                        }
+
                         return Poll::Ready(Ok((stream, service)));
                     }
                     Poll::Ready(Ok(Err(e))) => return Poll::Ready(Err(e)),

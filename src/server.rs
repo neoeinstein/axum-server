@@ -20,6 +20,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
 };
+use tracing::Instrument;
 
 /// HTTP server.
 #[derive(Debug)]
@@ -171,17 +172,56 @@ impl<A> Server<A> {
 
         let accept_loop_future = async {
             loop {
+                let accept_connection_span = tracing::debug_span!(
+                    parent: tracing::Span::none(),
+                    "accept connection",
+                    server.address = %incoming.local_addr().ip(),
+                    server.port = incoming.local_addr().port(),
+                    client.address = tracing::field::Empty,
+                    client.port = tracing::field::Empty,
+                );
                 let addr_stream = tokio::select! {
                     biased;
-                    result = accept(&mut incoming) => result?,
+                    result = accept(&mut incoming).instrument(accept_connection_span.clone()) => result?,
                     _ = handle.wait_graceful_shutdown() => return Ok(()),
                 };
 
+                if !accept_connection_span.is_disabled() {
+                    accept_connection_span.record(
+                        "client.address",
+                        tracing::field::display(addr_stream.remote_addr().ip()),
+                    );
+                    accept_connection_span.record("client.port", addr_stream.remote_addr().port());
+                }
+
+                let connection_span = tracing::debug_span!(
+                    parent: tracing::Span::none(),
+                    "connection",
+                    server.address = %incoming.local_addr().ip(),
+                    server.port = incoming.local_addr().port(),
+                    client.address = %addr_stream.remote_addr().ip(),
+                    client.port = addr_stream.remote_addr().port(),
+                );
+                connection_span.follows_from(accept_connection_span.clone());
+
+                let ready_make_service_span = tracing::debug_span!(
+                    parent: connection_span.id(),
+                    "ready make service"
+                );
                 poll_fn(|cx| make_service.poll_ready(cx))
+                    .instrument(ready_make_service_span)
                     .await
                     .map_err(io_other)?;
 
-                let service = match make_service.make_service(&addr_stream).await {
+                let make_service_span = tracing::debug_span!(
+                    parent: connection_span.id(),
+                    "make service"
+                );
+                let service = match make_service
+                    .make_service(&addr_stream)
+                    .instrument(make_service_span)
+                    .await
+                {
                     Ok(service) => service,
                     Err(_) => continue,
                 };
@@ -191,19 +231,19 @@ impl<A> Server<A> {
                 let http_conf = http_conf.clone();
 
                 tokio::spawn(async move {
-                    if let Ok((stream, send_service)) = acceptor.accept(addr_stream, service).await
+                    if let Ok((stream, send_service)) = acceptor
+                        .accept(addr_stream, service)
+                        .instrument(
+                            tracing::debug_span!(parent: connection_span.id(), "accept handshake"),
+                        )
+                        .await
                     {
                         let service = send_service.into_service();
-
-                        let mut serve_future = http_conf
-                            .inner
-                            .serve_connection(stream, service)
-                            .with_upgrades();
-
+                        let mut serve_future = http_conf.inner.serve_connection(stream, service).with_upgrades().instrument(tracing::debug_span!(parent: connection_span.id(), "serve connection"));
                         tokio::select! {
                             biased;
                             _ = watcher.wait_graceful_shutdown() => {
-                                Pin::new(&mut serve_future).graceful_shutdown();
+                                Pin::new(&mut serve_future).inner_pin_mut().graceful_shutdown();
                                 tokio::select! {
                                     biased;
                                     _ = watcher.wait_shutdown() => (),
